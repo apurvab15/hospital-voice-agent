@@ -15,15 +15,11 @@ def init_db():
             patient_name TEXT NOT NULL,
             phone TEXT,
             doctor TEXT NOT NULL,
-            appointment_datetime TEXT NOT NULL,   -- 'YYYY-MM-DD HH:MM'
+            date TEXT NOT NULL,
+            time TEXT NOT NULL,   -- 'HH:MM' //24H
             status TEXT NOT NULL DEFAULT 'scheduled',
             reminder_sent INTEGER NOT NULL DEFAULT 0
         )
-    """)
-    conn.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS ux_doctor_slot
-        ON appointments(doctor, appointment_datetime)
-        WHERE status = 'scheduled'
     """)
     conn.commit()
     conn.close()

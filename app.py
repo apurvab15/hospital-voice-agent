@@ -1,106 +1,98 @@
 import sqlite3
+import json
 from datetime import datetime
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, HTMLResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 import os
 import requests
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 from db import get_db
 
-HOSPITAL_TZ = ZoneInfo("America/Chicago")   # set this to the hospital's time zone
+
 RETELL_URL = "https://api.retellai.com/v2/create-phone-call"
 
-def send_reminders():
-    api_key = os.getenv("RETELL_API_KEY")
-    from_number = os.getenv("RETELL_FROM_NUMBER")
-    dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
-
-    tomorrow = (datetime.now(HOSPITAL_TZ) + timedelta(days=1)).strftime("%Y-%m-%d")
-
-    conn = get_db()
-    rows = conn.execute(
-        """SELECT id, patient_name, phone, doctor, appointment_datetime
-           FROM appointments
-           WHERE date(appointment_datetime) = ?
-             AND status = 'scheduled'
-             AND reminder_sent = 0
-             AND phone IS NOT NULL""",
-        (tomorrow,),
-    ).fetchall()
-
-    sent, failed = 0, 0
-    for r in rows:
-        payload = {
-            "from_number": from_number,
-            "to_number": r["phone"],
-            "retell_llm_dynamic_variables": {
-                "patient_name": r["patient_name"],
-                "doctor": r["doctor"],
-                "appointment_time": r["appointment_datetime"],
-            },
-            "metadata": {"appointment_id": r["id"], "type": "reminder"},
-        }
-
-        if dry_run:
-            print("[DRY RUN] would call:", payload)
-            continue
-
-        try:
-            resp = requests.post(
-                RETELL_URL,
-                headers={"Authorization": f"Bearer {api_key}"},
-                json=payload,
-                timeout=10,
-            )
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            failed += 1
-            print(f"Reminder failed for appointment {r['id']}: {e}")
-            continue
-
-        conn.execute("UPDATE appointments SET reminder_sent = 1 WHERE id = ?", (r["id"],))
-        conn.commit()
-        sent += 1
-
-    conn.close()
-    return {"tomorrow": tomorrow, "matched": len(rows), "sent": sent,
-            "failed": failed, "dry_run": dry_run}
-
 from db import get_db, init_db
-from schema import RetellFunctionCall
 from reminders import send_reminders, HOSPITAL_TZ
+from retell import Retell
 
 scheduler = BackgroundScheduler(timezone=HOSPITAL_TZ)
+retell = Retell(api_key=os.environ["RETELL_API_KEY"])
+
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    scheduler.add_job(send_reminders, CronTrigger(hour=18, minute=0, timezone=HOSPITAL_TZ),
-                      id="daily_reminders", replace_existing=True)
-    scheduler.start()
     yield
-    scheduler.shutdown()
 
 app = FastAPI(lifespan=lifespan)
 
-@app.post("/functions/book_appointment")
-def book_appointment(payload: RetellFunctionCall):
-    args = payload.args
+async def verify_and_parse(request : Request):
+    raw_body = (await request.body()).decode("utf-8")
+    content = json.loads(raw_body)
+
+    print("=== Incoming request ===")
+    print(json.dumps(content.get("args",{}), indent=2))
+    print("========================")
+    
+    valid = retell.verify(
+        raw_body, 
+        api_key=os.environ["RETELL_API_KEY"],
+        signature=request.headers.get("X-Retell-Signature")
+    )
+    if not valid:
+        return None
+    
+   
+    return content
+
+@app.get("/")
+async def welcome():
+    return HTMLResponse("<h1>Welcome to Retell Medical Clinic!</h1>")
+
+
+@app.get("/check-availability")
+async def check_availability():
+    
+    print("Checking Avaliblilty")
+    
+    return JSONResponse(status_code=200, content={
+        "status": "success",
+        "available": True,
+        "hours": "9:00 AM - 5:00 PM",
+        "days": "every day"
+    })
+
+@app.post("/book-appointment")
+async def book_appointment(request : Request):
+    content = await verify_and_parse(request)
+
+    if content is None :
+        return JSONResponse(status_code=401,content={ "message" : "Unauthorized"})
+    
+    
+    args = content.get("args", {})
     name = (args.get("patient_name") or "").strip()
     doctor = (args.get("doctor") or "").strip()
-    when = (args.get("appointment_datetime") or "").strip()
-    phone = payload.call.get("from_number") or args.get("phone")
+    time = (args.get("time") or "").strip()
+    date = (args.get("date") or "").strip()
+    phone = (args.get("phone")  or "").strip()
+    
+    print(name, doctor, date, time)
 
-    if not (name and doctor and when):
-        return {"result": "I still need the patient's name, the doctor, and the date and time."}
-
+    if not (name and date and time):
+        return JSONResponse(status_code=404, content={ 
+            "message": "Missing name, doctor or appointment time"
+        })
+    
+    """
     try:
         dt = datetime.strptime(when, "%Y-%m-%d %H:%M")
     except ValueError:
@@ -108,13 +100,14 @@ def book_appointment(payload: RetellFunctionCall):
 
     if dt <= datetime.now(HOSPITAL_TZ).replace(tzinfo=None):
         return {"result": "That time has already passed. Could we pick a future time?"}
-
+    """
+    
     conn = get_db()
     try:
         cur = conn.execute(
-            "INSERT INTO appointments (patient_name, phone, doctor, appointment_datetime) "
-            "VALUES (?, ?, ?, ?)",
-            (name, phone, doctor, when),
+            "INSERT INTO appointments (patient_name, phone, doctor, date, time) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (name, phone, doctor, date, time),
         )
         conn.commit()
         appointment_id = cur.lastrowid
@@ -123,9 +116,27 @@ def book_appointment(payload: RetellFunctionCall):
     finally:
         conn.close()
 
-    return {"result": f"You're booked with {doctor} on {dt.strftime('%A, %B %d at %I:%M %p')}. "
-                      f"Your confirmation number is {appointment_id}."}
+    return JSONResponse(status_code=200, content={
+        "status": "success",
+        "appointment_id": appointment_id,
+        "patient_name": name,
+        "doctor": doctor,
+        "date": date,
+        "time": time
+    })
+
+"""
+@app.delete("/cancel_appointment")
+def cancel_appointment(payload: RetellFunctionCall):
+    args = payload
+    name = 
+
+
+
 
 @app.post("/jobs/send-reminders")
 def run_reminders_now():
     return send_reminders()
+
+
+"""

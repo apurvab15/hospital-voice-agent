@@ -1,0 +1,11 @@
+{
+  "name": "book_appointment",
+  "call": {},
+  "args": {
+    "patient_name": "Jane Smith",
+    "doctor": "Dr. Patel",
+    "date": "2026-10-05",
+    "time": "14:00",
+    "phone": "+15551234567"
+  }
+}
